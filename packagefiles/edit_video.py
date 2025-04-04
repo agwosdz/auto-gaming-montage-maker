@@ -3,6 +3,9 @@ import cv2
 import os
 import tempfile
 import numpy as np
+import subprocess # <-- Import subprocess
+import uuid     # <-- For unique filenames
+import shutil   # <-- For cleaning up temp directory
 
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from ultralytics import YOLO
@@ -97,17 +100,65 @@ def auto_game_montage(*args):
         turn_off_effects = False
     detections = 0
     path_to_video = args[0]
-    output_filename = os.path.splitext(os.path.basename(path_to_video))[0]
-    if ';' in args[0]:
+    output_filename = os.path.splitext(os.path.basename(path_to_video))[0]  
+    output_dir_final = args[1] # Where the final file goes
+    output_filename_base = os.path.splitext(os.path.basename(path_to_video))[0]
+    
+    # Create a temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp(prefix="montage_temp_")
+    print(f"Program: Using temporary directory: {temp_dir}")
+
+    # Handle multiple input videos (concatenate using FFmpeg for speed)
+    if ';' in path_to_video:
         video_file_paths = args[0].split(';')
-        video_clips = [VideoFileClip(file_path) for file_path in video_file_paths]
-        concatenated_clip = concatenate_videoclips(video_clips, method="compose")
-        path_to_video = os.path.join(tempfile.gettempdir(), "tempVID_AJKLF176.mp4")
-        print("Program: Combining your clips...")
-        concatenated_clip.write_videofile(path_to_video, logger=None)  # TODO: user should be able to adjust this 1
-        print("Program: Done combining clips.")
-        for clip in video_clips:
-            clip.close()
+        concat_list_path = os.path.join(temp_dir, "concat_list.txt")
+        temp_concat_output = os.path.join(temp_dir, "tempVID_AJKLF176_concat.mp4")
+
+        with open(concat_list_path, 'w') as f:
+            for file_path in video_file_paths:
+                # FFmpeg requires escaped paths, especially on Windows
+                escaped_path = file_path.replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        print("Program: Combining your clips using FFmpeg...")
+        # Use FFmpeg concat demuxer - requires files to be similar format
+        # Add '-c copy' for stream copying (fastest if compatible)
+        # Add '-safe 0' because paths might be absolute
+        ffmpeg_command_concat = [
+            'ffmpeg', '-y', # Overwrite output without asking
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_list_path,
+            '-c', 'copy', # Assumes compatible streams, may need re-encoding if not
+            temp_concat_output
+        ]
+        try:
+            # Hide FFmpeg output unless debugging
+            subprocess.run(ffmpeg_command_concat, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("Program: Done combining clips.")
+            path_to_video = temp_concat_output # Use the combined file
+        except subprocess.CalledProcessError as e:
+                print(f"Error during initial FFmpeg concatenation: {e}")
+                print("Attempting re-encoding concatenation (slower)...")
+                # Fallback: Re-encoding concat filter (slower but more robust)
+                filter_complex = "".join([f"[{i}:v][{i}:a]" for i in range(len(video_file_paths))]) + \
+                                f"concat=n={len(video_file_paths)}:v=1:a=1[outv][outa]"
+                ffmpeg_command_filter = ['ffmpeg', '-y']
+                for file_path in video_file_paths:
+                    ffmpeg_command_filter.extend(['-i', file_path])
+                ffmpeg_command_filter.extend([
+                    '-filter_complex', filter_complex,
+                    '-map', '[outv]', '-map', '[outa]',
+                    temp_concat_output
+                ])
+                try:
+                    subprocess.run(ffmpeg_command_filter, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print("Program: Done combining clips (re-encoding).")
+                    path_to_video = temp_concat_output
+                except subprocess.CalledProcessError as e2:
+                    print(f"FATAL: Failed FFmpeg concatenation even with re-encoding: {e2}")
+                    return # Abort if concatenation fails
+
     if not os.path.isabs(args[2]):
         if args[2] == 'none':
             music_choice = absolute_paths('editing_sfx/none.mp3')
